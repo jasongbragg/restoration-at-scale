@@ -32,8 +32,6 @@ nohup python3 stage1/build_groundtruth.py > build.log 2>&1 &
 # Validate a completed world:
 python3 stage1/validate_groundtruth.py
 
-# Sample a collection design (once ground truth exists):
-python3 stage2/demo.py
 ```
 
 ## Parameters
