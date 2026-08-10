@@ -56,11 +56,4 @@ reproduced from code alone.
 - `docs/NEXT_PHASE_PLANNING.md` — forward planning notes (genome size, parallelism, containers)
 - `docs/RUNBOOK.md` — concrete server execution steps
 
-## Working with Claude
 
-This repository is the shared workspace. Claude can read files directly
-from GitHub (via the raw URL or API) when given the repo URL. Workflow:
-1. Make code changes locally, push to `main`
-2. Share the repo URL or specific file URLs with Claude
-3. Claude fetches the current code, proposes changes as files for download
-4. Download, review, add to repo, push
