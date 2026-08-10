@@ -8,7 +8,12 @@ linear stepping-stone chains, tuned against the real Fst=0.05 target
 Run: python stage1_calibrate_single_locus.py
 """
 
-from stage1_utils import simulate_fst_replicated
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+from stage1.utils import simulate_fst_replicated  # type: ignore[import]
+# NOTE: this script uses the superseded nei_gst_corrected estimator
+# (see docs/PROJECT_SUMMARY.md Section 6, lesson 4) and is retained
+# as calibration history only -- not for re-use.
 
 if __name__ == "__main__":
     target_fst = 0.05

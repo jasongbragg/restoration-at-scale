@@ -17,7 +17,10 @@ genome size decision.
 Run: python stage1_calibrate_11chrom.py
 """
 
-from stage1_utils import simulate_fst_multichrom_replicated
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+from stage1.utils import simulate_fst_multichrom_replicated  # type: ignore[import]
+# NOTE: historical calibration script -- superseded estimator, retained for reference.
 
 if __name__ == "__main__":
     target_fst = 0.05

@@ -16,7 +16,9 @@ the true calibrated migration rate needs to be higher than we thought.
 Run: python stage1_recalibrate_tskit_native.py
 """
 
-from stage1_utils import simulate_branch_gst_replicated, build_chromosome_ts, branch_gst
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+from stage1.utils import simulate_branch_gst_replicated, build_chromosome_ts, branch_gst
 
 if __name__ == "__main__":
     print("Step 1: confirm the bias at the OLD calibrated value (m=0.0024)")
