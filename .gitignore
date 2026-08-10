@@ -1,0 +1,34 @@
+# Simulation outputs -- large tree-sequence files, NOT committed to git.
+# Back these up separately (S3, NAS, etc.). Outputs are fully reproducible
+# from the code + params.py given the same seeds.
+data/
+groundtruth/
+designs/
+
+# Any stray .trees files anywhere in the repo (belt-and-suspenders)
+*.trees
+
+# Logs
+*.log
+nohup.out
+build.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+.env
+.venv/
+venv/
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
