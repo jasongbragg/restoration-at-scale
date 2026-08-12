@@ -1,66 +1,42 @@
 """
 stage2/diversity.py
 
-Diversity outcome statistics for Stage 2 (collection-design sampling).
-Takes the output of stage2/sampling.sample_design() and computes the
-genetic diversity metrics that are the primary deliverable of the analysis.
+Diversity outcome statistics for Stage 2 collection designs.
+
+Takes the output of stage2/sampling.sample_design() and computes
+genetic diversity metrics for the generated seed cohort.
+
+TWO MODES
+---------
+Seeds mode (sample_result contains 'seed_structure'):
+    The tree sequence has been simplified to the unique haplotype set
+    involved in the seeds. seed_structure[(i)] = (maternal_pos, paternal_pos)
+    gives each seed's two haplotype positions within that ordering.
+    Statistics are computed from the per-seed diploid genotype matrix.
+
+Background mode (no seed_structure, e.g. compute_background()):
+    The tree sequence has all K*N_PER_DEME haploid samples. Statistics
+    use tskit native site-mode functions directly.
 
 METRICS
 -------
-The following statistics are computed across all chromosomes in a sampled
-design and compared against the wild-population background:
-
-  pi (nucleotide diversity)
-      tskit site-mode diversity, averaged across chromosomes and normalised
-      to per-bp. Matches what you would compute from real sequencing data.
-
-  He (expected heterozygosity)
-      Mean 2pq across all segregating sites across all chromosomes.
-      Computed from the allele frequency spectrum rather than from paired
-      genotypes, so it doesn't depend on the haploid/diploid pairing.
-
-  n_seg_sites / seg_sites_per_bp
-      Total number of segregating sites (summed across chromosomes) and
-      the density per base pair.
-
-  Allele frequency spectrum (AFS)
-      Folded, summed across all chromosomes. Shape (n_samples//2 + 1,).
-
-  ROH (runs of homozygosity)
-      Computed on synthetic diploid individuals formed by pairing
-      consecutive haploid samples: (0,1), (2,3), ...
-      See PLOIDY NOTE below.
-
-PLOIDY NOTE
------------
-The ground truth was simulated with ploidy=1 (haploid), meaning each
-"mother tree" in the collection is represented by one haploid chromosome
-per genome-chromosome. For ROH and observed heterozygosity, a diploid
-model is needed. This module pairs consecutive haploid samples to form
-synthetic diploid individuals:
-  individual 0: haploid samples 0 and 1
-  individual 1: haploid samples 2 and 3
-  ...
-This is a reasonable approximation for a randomly-mating outcrossing
-population. The effective diploid sample size is half the haploid sample
-count. For n_sites=4, mothers_per_site=8 (total N=32 haploid samples),
-we get 16 synthetic diploid individuals.
-
-If a design requests an odd number of total haploid samples, the last
-sample is silently dropped from ROH/Ho computation (flagged in output).
-
-OUTPUT FORMAT
--------------
-compute_diversity() returns a DiversityResult dataclass. Use .to_dict()
-to get a flat dict suitable for writing to CSV/JSON, or pass the whole
-result to compare_to_background() to get proportional capture metrics.
+pi          : nucleotide diversity per bp (Nei 1987 unbiased estimator
+              from genotype matrix: mean of n/(n-1)*2pq across sites)
+He          : expected heterozygosity (mean 2pq across seg sites)
+n_seg_sites : number of segregating sites across all chromosomes
+AFS         : folded allele frequency spectrum (summed across chromosomes)
+ROH         : runs of homozygosity per diploid seed (or per synthetic
+              diploid pair in background mode). min_length configurable.
 """
 
+import copy
+import glob
 import os
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from typing import Optional
 
+import msprime
 import numpy as np
 import tskit
 
@@ -74,45 +50,33 @@ import params
 
 @dataclass
 class DiversityResult:
-    """Diversity statistics for one sampled design (all chromosomes pooled)."""
-
-    # --- provenance --------------------------------------------------------
-    n_haploid_samples: int          # total samples in the simplified ts
-    n_diploid_individuals: int      # = n_haploid_samples // 2 (for ROH)
+    n_individuals: int          # seeds (or haploid samples / 2 for background)
     n_chromosomes: int
     total_bp: float
 
-    # --- nucleotide diversity (pi) -----------------------------------------
-    pi_mean: float                  # mean per-bp pi across chromosomes
-    pi_per_chrom: list              # per-chromosome per-bp values
+    pi_mean: float              # per-bp, mean across chromosomes
+    pi_per_chrom: list
 
-    # --- segregating sites -------------------------------------------------
     n_seg_sites_total: int
     seg_sites_per_bp: float
 
-    # --- expected heterozygosity -------------------------------------------
-    He_mean: float                  # mean 2pq across all seg sites
-    He_per_chrom: list              # per-chromosome values
+    He_mean: float
+    He_per_chrom: list
 
-    # --- allele frequency spectrum (folded) --------------------------------
-    afs: list                       # shape (n_haploid_samples//2 + 1,)
+    afs: list                   # folded, summed across chromosomes
 
-    # --- ROH (runs of homozygosity, synthetic diploid pairs) ---------------
-    roh_min_length_bp: int          # minimum ROH length used
-    roh_mean_n: float               # mean number of ROH per individual
-    roh_mean_total_length: float    # mean total ROH bp per individual
-    roh_mean_longest: float         # mean length of longest ROH
-    roh_fraction_genome: float      # mean fraction of genome in ROH
-    roh_odd_samples_dropped: bool   # True if one haploid sample was dropped
+    roh_min_length_bp: int
+    roh_mean_n: float
+    roh_mean_total_length: float
+    roh_mean_longest: float
+    roh_fraction_genome: float
 
-    # --- comparison to background (filled in by compare_to_background) -----
     pi_fraction_of_background: Optional[float] = None
     He_fraction_of_background: Optional[float] = None
     seg_sites_fraction_of_background: Optional[float] = None
 
     def to_dict(self):
         d = asdict(self)
-        # flatten per-chrom lists to summary stats only for CSV friendliness
         d.pop("pi_per_chrom")
         d.pop("He_per_chrom")
         d.pop("afs")
@@ -120,81 +84,98 @@ class DiversityResult:
 
 
 # ---------------------------------------------------------------------------
-# Core statistics from tskit native functions
+# Genotype-matrix statistics (used for seeds mode)
+# ---------------------------------------------------------------------------
+
+def _stats_from_geno(geno: np.ndarray, seq_length: float):
+    """
+    Compute pi, He, n_seg_sites, and AFS from a (n_sites, n_haploid) geno
+    matrix (0/1 values). n_haploid = 2 * n_seeds for diploid seeds.
+
+    pi uses the Nei (1987) unbiased estimator: n/(n-1) * 2pq per site.
+    Returns dict with keys: pi, He, n_seg, afs_counts.
+    """
+    if geno.shape[0] == 0:
+        n_hap = geno.shape[1]
+        return dict(pi=0.0, He=0.0, n_seg=0,
+                    afs=np.zeros(n_hap // 2 + 1))
+
+    n_hap = geno.shape[1]
+    counts = geno.sum(axis=1)           # derived allele count per site
+    p = counts / n_hap                  # derived allele frequency
+    seg = (p > 0) & (p < 1)
+
+    He_vals = 2 * p[seg] * (1 - p[seg])
+    He = float(He_vals.mean()) if seg.sum() > 0 else 0.0
+
+    # Nei unbiased pi: correction factor n/(n-1)
+    correction = n_hap / (n_hap - 1) if n_hap > 1 else 1.0
+    pi_per_site = correction * 2 * p[seg] * (1 - p[seg])
+    pi = float(pi_per_site.mean() / seq_length) if seg.sum() > 0 else 0.0
+
+    # folded AFS: bincount of min(count, n-count)
+    folded_counts = np.minimum(counts[seg].astype(int), n_hap - counts[seg].astype(int))
+    afs = np.bincount(folded_counts, minlength=n_hap // 2 + 1).astype(float)
+
+    return dict(pi=pi, He=He, n_seg=int(seg.sum()), afs=afs)
+
+
+# ---------------------------------------------------------------------------
+# Background-mode statistics (tskit native, no seed_structure)
 # ---------------------------------------------------------------------------
 
 def _pi_from_ts(ts: tskit.TreeSequence) -> float:
-    """Per-bp nucleotide diversity (site mode) for all samples in ts.
-
-    ts.diversity(span_normalise=True) -- the default -- already returns
-    per-bp diversity. Do NOT divide by sequence_length again; the earlier
-    version of this function did so and produced values ~4e-10 instead of
-    the correct ~2e-3 for Ne=100,000, mu=1e-8.
-    """
+    """Per-bp nucleotide diversity (site mode). ts.diversity with
+    span_normalise=True already returns per-bp; do NOT divide again."""
     if ts.num_mutations == 0:
         return 0.0
     n = ts.num_samples
-    pi = ts.diversity(sample_sets=[list(range(n))], mode="site")[0]
-    return float(pi)  # already per-bp
+    return float(ts.diversity(sample_sets=[list(range(n))], mode="site")[0])
 
 
 def _seg_sites_from_ts(ts: tskit.TreeSequence) -> int:
-    """Number of segregating sites (site mode).
-    ts.segregating_sites(mode='site') returns a per-bp rate; multiply by
-    sequence_length to get the raw count."""
+    """Number of segregating sites: ts.segregating_sites returns per-bp,
+    multiply by sequence_length to get raw count."""
     if ts.num_mutations == 0:
         return 0
     return int(round(ts.segregating_sites(mode="site") * ts.sequence_length))
 
 
 def _He_from_geno(geno: np.ndarray) -> float:
-    """Mean expected heterozygosity (2pq) across all sites in geno matrix.
-    geno: (n_sites, n_haploid_samples), values 0/1."""
     if geno.shape[0] == 0:
         return 0.0
     n = geno.shape[1]
     p = geno.sum(axis=1) / n
     seg = (p > 0) & (p < 1)
-    if seg.sum() == 0:
-        return 0.0
-    return float((2 * p[seg] * (1 - p[seg])).mean())
+    return float((2 * p[seg] * (1 - p[seg])).mean()) if seg.sum() > 0 else 0.0
 
 
 def _afs_from_ts(ts: tskit.TreeSequence, n_samples: int) -> np.ndarray:
-    """Folded allele frequency spectrum (site mode), shape (n//2 + 1,)."""
     if ts.num_mutations == 0:
         return np.zeros(n_samples // 2 + 1)
     afs = ts.allele_frequency_spectrum(
         sample_sets=[list(range(n_samples))],
         mode="site", polarised=False, span_normalise=False,
     )
-    # tskit returns shape (n_samples + 1,) for folded; slice to (n//2 + 1,)
     return np.array(afs[: n_samples // 2 + 1])
 
 
 # ---------------------------------------------------------------------------
-# ROH on synthetic diploid pairs
+# ROH (works for both modes -- takes the per-individual genotype columns)
 # ---------------------------------------------------------------------------
 
-def _roh_from_geno(geno: np.ndarray, positions: np.ndarray,
-                    chrom_length: float, min_length: int) -> list:
+def _roh_from_pairs(geno: np.ndarray, positions: np.ndarray,
+                     pairs: list, chrom_length: float, min_length: int):
     """
-    For each synthetic diploid individual (paired consecutive haploid
-    samples), find ROH >= min_length bp. Returns a list of lists of ROH
-    lengths, one inner list per diploid individual.
-
-    geno:       (n_sites, n_haploid_samples)
-    positions:  (n_sites,) physical positions
+    Compute ROH for each individual defined by pairs of column indices.
+    pairs: list of (col_a, col_b) giving the two haplotypes of each diploid.
+    Returns a list of ROH length lists, one per individual.
     """
-    n_hap = geno.shape[1]
-    n_dip = n_hap // 2
     roh_by_ind = []
-
-    for i in range(n_dip):
-        h1 = geno[:, 2 * i]
-        h2 = geno[:, 2 * i + 1]
+    for col_a, col_b in pairs:
+        h1 = geno[:, col_a]
+        h2 = geno[:, col_b]
         het_pos = positions[h1 != h2]
-        # homozygous stretches are gaps between consecutive het sites
         boundaries = np.concatenate([[0.0], het_pos, [chrom_length]])
         roh = [
             float(boundaries[k + 1] - boundaries[k])
@@ -202,33 +183,21 @@ def _roh_from_geno(geno: np.ndarray, positions: np.ndarray,
             if boundaries[k + 1] - boundaries[k] >= min_length
         ]
         roh_by_ind.append(roh)
-
     return roh_by_ind
 
 
-def _aggregate_roh(roh_per_chrom_per_ind: list, total_bp: float) -> dict:
-    """
-    Aggregate per-chromosome, per-individual ROH lists into summary stats.
-
-    roh_per_chrom_per_ind: list of (per-individual ROH lists), one entry
-        per chromosome. Each entry is a list of length n_diploid_individuals
-        containing lists of ROH lengths for that individual on that chrom.
-    """
-    if not roh_per_chrom_per_ind:
+def _aggregate_roh(roh_per_chrom: list, total_bp: float) -> dict:
+    if not roh_per_chrom:
         return dict(roh_mean_n=0.0, roh_mean_total_length=0.0,
                     roh_mean_longest=0.0, roh_fraction_genome=0.0)
-
-    n_dip = len(roh_per_chrom_per_ind[0])
-    # flatten across chromosomes per individual
-    all_roh = [[] for _ in range(n_dip)]
-    for chrom_roh in roh_per_chrom_per_ind:
-        for ind_idx, ind_roh in enumerate(chrom_roh):
-            all_roh[ind_idx].extend(ind_roh)
-
+    n_ind = len(roh_per_chrom[0])
+    all_roh = [[] for _ in range(n_ind)]
+    for chrom_roh in roh_per_chrom:
+        for i, ind_roh in enumerate(chrom_roh):
+            all_roh[i].extend(ind_roh)
     totals = [sum(r) for r in all_roh]
     counts = [len(r) for r in all_roh]
     longest = [max(r) if r else 0.0 for r in all_roh]
-
     return dict(
         roh_mean_n=float(np.mean(counts)),
         roh_mean_total_length=float(np.mean(totals)),
@@ -238,7 +207,7 @@ def _aggregate_roh(roh_per_chrom_per_ind: list, total_bp: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Main entry points
+# Main entry point
 # ---------------------------------------------------------------------------
 
 def compute_diversity(sample_result: dict,
@@ -246,27 +215,18 @@ def compute_diversity(sample_result: dict,
     """
     Compute diversity statistics from one sample_design() result.
 
-    Parameters
-    ----------
-    sample_result : dict
-        Output of stage2.sampling.sample_design(). Must contain key
-        'chrom_ts': {chrom_idx: tskit.TreeSequence}.
-    roh_min_length : int
-        Minimum ROH length in bp (default 100kb).
-
-    Returns
-    -------
-    DiversityResult
+    Handles both seeds mode (seed_structure present) and background mode.
     """
     chrom_ts = sample_result["chrom_ts"]
+    seed_structure = sample_result.get("seed_structure", None)
     chroms = sorted(chrom_ts.keys())
 
     if not chroms:
         raise ValueError("sample_result['chrom_ts'] is empty")
 
-    n_samples = chrom_ts[chroms[0]].num_samples
-    n_dip = n_samples // 2
-    odd_drop = (n_samples % 2 != 0)
+    seeds_mode = seed_structure is not None
+    n_individuals = (len(seed_structure) if seeds_mode
+                     else chrom_ts[chroms[0]].num_samples // 2)
 
     pi_per_chrom, He_per_chrom = [], []
     afs_total = None
@@ -279,37 +239,63 @@ def compute_diversity(sample_result: dict,
         chrom_len = ts.sequence_length
         total_bp += chrom_len
 
-        # nucleotide diversity
-        pi_per_chrom.append(_pi_from_ts(ts))
+        if seeds_mode:
+            # --- seeds mode: build per-seed genotype matrix ---
+            if ts.num_mutations == 0:
+                pi_per_chrom.append(0.0)
+                He_per_chrom.append(0.0)
+                continue
 
-        # segregating sites
-        n_seg_total += _seg_sites_from_ts(ts)
-
-        # He and ROH need the genotype matrix
-        if ts.num_mutations > 0:
-            geno = ts.genotype_matrix()
+            geno_all = ts.genotype_matrix()  # (n_sites, n_unique_samples)
             positions = np.array([v.position for v in ts.variants()])
 
-            He_per_chrom.append(_He_from_geno(geno))
+            # build seed genotype matrix: interleaved maternal/paternal columns
+            seed_cols = [col for pair in seed_structure for col in pair]
+            geno_seeds = geno_all[:, seed_cols]  # (n_sites, 2*n_seeds)
 
-            # ROH on synthetic diploid pairs
-            roh_by_ind = _roh_from_geno(geno, positions, chrom_len, roh_min_length)
-            roh_per_chrom.append(roh_by_ind)
+            st = _stats_from_geno(geno_seeds, chrom_len)
+            pi_per_chrom.append(st["pi"])
+            He_per_chrom.append(st["He"])
+            n_seg_total += st["n_seg"]
+            afs_total = st["afs"] if afs_total is None else afs_total + st["afs"]
 
-            # AFS
-            afs_c = _afs_from_ts(ts, n_samples)
-            afs_total = afs_c if afs_total is None else afs_total + afs_c
+            # ROH: use seed_structure pairs directly
+            if geno_seeds.shape[0] > 0:
+                roh_by_ind = _roh_from_pairs(
+                    geno_seeds, positions, seed_structure, chrom_len, roh_min_length
+                )
+                roh_per_chrom.append(roh_by_ind)
+
         else:
-            He_per_chrom.append(0.0)
+            # --- background mode: use tskit native statistics ---
+            pi_per_chrom.append(_pi_from_ts(ts))
+            n_seg_total += _seg_sites_from_ts(ts)
 
+            if ts.num_mutations > 0:
+                geno = ts.genotype_matrix()
+                positions = np.array([v.position for v in ts.variants()])
+                He_per_chrom.append(_He_from_geno(geno))
+                n_samp = ts.num_samples
+                afs_c = _afs_from_ts(ts, n_samp)
+                afs_total = afs_c if afs_total is None else afs_total + afs_c
+                # consecutive-pair ROH for background
+                pairs = [(2 * i, 2 * i + 1) for i in range(n_samp // 2)]
+                roh_by_ind = _roh_from_pairs(
+                    geno, positions, pairs, chrom_len, roh_min_length
+                )
+                roh_per_chrom.append(roh_by_ind)
+            else:
+                He_per_chrom.append(0.0)
+
+    n_afs = (2 * n_individuals if seeds_mode
+             else chrom_ts[chroms[0]].num_samples)
     if afs_total is None:
-        afs_total = np.zeros(n_samples // 2 + 1)
+        afs_total = np.zeros(n_afs // 2 + 1)
 
     roh_stats = _aggregate_roh(roh_per_chrom, total_bp)
 
     return DiversityResult(
-        n_haploid_samples=n_samples,
-        n_diploid_individuals=n_dip,
+        n_individuals=n_individuals,
         n_chromosomes=len(chroms),
         total_bp=total_bp,
         pi_mean=float(np.mean(pi_per_chrom)),
@@ -324,105 +310,160 @@ def compute_diversity(sample_result: dict,
         roh_mean_total_length=roh_stats["roh_mean_total_length"],
         roh_mean_longest=roh_stats["roh_mean_longest"],
         roh_fraction_genome=roh_stats["roh_fraction_genome"],
-        roh_odd_samples_dropped=odd_drop,
     )
 
 
 def compute_background(groundtruth_dir: str, world_idx: int = 0,
                         roh_min_length: int = 100_000) -> DiversityResult:
     """
-    Compute diversity statistics from the full ground-truth tree sequences
-    (without any sampling/simplification). Used as the wild-population
-    baseline for comparison.
-
-    Ground truth .trees files are stored mutation-free (ancestry only);
-    mutations are overlaid here at a fixed seed before computing statistics,
-    consistent with how sample_design() works. The seed is deterministic
-    given world_idx so the background is reproducible.
-
-    This is relatively expensive (K * N_PER_DEME samples per chromosome).
-    Cache the result rather than recomputing it for every design comparison:
-        import pickle
-        bg = compute_background("data/groundtruth", world_idx=0)
-        pickle.dump(bg, open("data/background_world00.pkl", "wb"))
+    Compute diversity from the full ground truth (wild-population baseline).
+    Mutations are overlaid before computing site-mode statistics.
+    Cache this result -- it is expensive and reused for every design comparison.
     """
-    import glob
-    import msprime
-
-    pattern = os.path.join(groundtruth_dir,
-                            f"world{world_idx:02d}_chr*.trees")
+    pattern = os.path.join(groundtruth_dir, f"world{world_idx:02d}_chr*.trees")
     paths = sorted(glob.glob(pattern))
     if not paths:
         raise FileNotFoundError(
-            f"No ground truth files found at {pattern}. "
+            f"No ground truth files at {pattern}. "
             f"Run stage1/build_groundtruth.py first."
         )
-
     chrom_ts = {}
     for p in paths:
         c = int(os.path.basename(p).split("_chr")[1].split(".")[0])
         ts = tskit.load(p)
-        # overlay mutations -- ground truth is stored ancestry-only;
-        # seed is deterministic per (world, chrom) so background is reproducible
         ts = msprime.sim_mutations(ts, rate=params.MU,
                                     random_seed=world_idx * 1000 + c + 1)
         chrom_ts[c] = ts
-
+    # background has no seed_structure
     return compute_diversity({"chrom_ts": chrom_ts}, roh_min_length=roh_min_length)
 
 
 def compare_to_background(result: DiversityResult,
                             background: DiversityResult) -> DiversityResult:
-    """
-    Fill in the *_fraction_of_background fields by dividing the sampled
-    design's statistics by the background (wild population) values.
-    Returns a new DiversityResult with those fields populated.
-    """
-    import copy
     r = copy.copy(result)
     r.pi_fraction_of_background = (
-        result.pi_mean / background.pi_mean
-        if background.pi_mean > 0 else None
-    )
+        result.pi_mean / background.pi_mean if background.pi_mean > 0 else None)
     r.He_fraction_of_background = (
-        result.He_mean / background.He_mean
-        if background.He_mean > 0 else None
-    )
+        result.He_mean / background.He_mean if background.He_mean > 0 else None)
     r.seg_sites_fraction_of_background = (
         result.seg_sites_per_bp / background.seg_sites_per_bp
-        if background.seg_sites_per_bp > 0 else None
-    )
+        if background.seg_sites_per_bp > 0 else None)
     return r
 
 
-# ---------------------------------------------------------------------------
-# Convenience: run one design and return a flat dict (for CSV/JSON output)
-# ---------------------------------------------------------------------------
 
-def design_stats_dict(sample_result: dict, background: Optional[DiversityResult] = None,
+def compute_maternal_diversity(sample_result: dict) -> DiversityResult:
+    """
+    Compute diversity statistics on the maternal lines (haploid cohort).
+
+    Uses the same simplified tree sequences already in sample_result --
+    no extra file loading. Maternal haplotypes sit at the 'maternal_positions'
+    within the simplified ts sample ordering.
+
+    These are the genotypes you would have if you genotyped the sampled
+    mother trees directly -- data typically collected in the field before
+    seedlings are propagated.
+
+    Statistics are haploid (one chromosome per mother tree): pi, He,
+    n_seg_sites, AFS. ROH is not meaningful for a haploid cohort of
+    distinct individuals and is returned as zeros.
+    """
+    chrom_ts = sample_result["chrom_ts"]
+    maternal_positions = sample_result.get("maternal_positions")
+    if maternal_positions is None:
+        raise ValueError(
+            "'maternal_positions' not found in sample_result. "
+            "Re-run sample_design() with the current version of sampling.py."
+        )
+
+    chroms = sorted(chrom_ts.keys())
+    n_mothers = len(maternal_positions)
+    pi_per_chrom, He_per_chrom = [], []
+    afs_total = None
+    n_seg_total = 0
+    total_bp = 0.0
+
+    for c in chroms:
+        ts = chrom_ts[c]
+        chrom_len = ts.sequence_length
+        total_bp += chrom_len
+
+        if ts.num_mutations == 0:
+            pi_per_chrom.append(0.0)
+            He_per_chrom.append(0.0)
+            continue
+
+        geno_all = ts.genotype_matrix()
+        geno_mat = geno_all[:, maternal_positions]   # (n_sites, n_mothers)
+
+        st = _stats_from_geno(geno_mat, chrom_len)
+        pi_per_chrom.append(st["pi"])
+        He_per_chrom.append(st["He"])
+        n_seg_total += st["n_seg"]
+        afs_total = st["afs"] if afs_total is None else afs_total + st["afs"]
+
+    if afs_total is None:
+        afs_total = np.zeros(n_mothers // 2 + 1)
+
+    return DiversityResult(
+        n_individuals=n_mothers,
+        n_chromosomes=len(chroms),
+        total_bp=total_bp,
+        pi_mean=float(np.mean(pi_per_chrom)),
+        pi_per_chrom=pi_per_chrom,
+        n_seg_sites_total=n_seg_total,
+        seg_sites_per_bp=n_seg_total / total_bp if total_bp > 0 else 0.0,
+        He_mean=float(np.mean(He_per_chrom)) if He_per_chrom else 0.0,
+        He_per_chrom=He_per_chrom,
+        afs=afs_total.tolist(),
+        roh_min_length_bp=0,
+        roh_mean_n=0.0,
+        roh_mean_total_length=0.0,
+        roh_mean_longest=0.0,
+        roh_fraction_genome=0.0,
+    )
+
+
+def design_stats_dict(sample_result: dict,
+                       background: Optional[DiversityResult] = None,
                        roh_min_length: int = 100_000) -> dict:
     """
-    Convenience wrapper: compute diversity, optionally compare to background,
-    merge the design provenance from sample_result, and return a flat dict.
+    Compute diversity for BOTH maternal lines and seeds, return as one
+    flat dict suitable for writing to CSV.
+
+    Maternal stats are prefixed 'mat_'; seed stats are prefixed 'seed_'.
+    Design provenance fields are unprefixed.
+
+    This is the primary output for the batch runner -- one row per
+    (design x world x seed) in the results CSV.
     """
-    from dataclasses import asdict
-
-    result = compute_diversity(sample_result, roh_min_length=roh_min_length)
+    # --- seeds ---
+    seed_result = compute_diversity(sample_result, roh_min_length=roh_min_length)
     if background is not None:
-        result = compare_to_background(result, background)
+        seed_result = compare_to_background(seed_result, background)
 
-    out = result.to_dict()
+    # --- maternal lines ---
+    mat_result = compute_maternal_diversity(sample_result)
+    if background is not None:
+        mat_result = compare_to_background(mat_result, background)
 
-    # add design provenance fields
+    seed_dict = {"seed_" + k: v for k, v in seed_result.to_dict().items()}
+    mat_dict = {"mat_" + k: v for k, v in mat_result.to_dict().items()
+                if not k.startswith("roh")}   # roh not meaningful for haploid maternal
+
+    out = {**seed_dict, **mat_dict}
+
     design = sample_result["design"]
     out["world_idx"] = sample_result["world_idx"]
     out["n_sites"] = design.n_sites
-    out["mothers_per_site"] = (
-        design.mothers_per_site if isinstance(design.mothers_per_site, int)
-        else "unequal"
-    )
-    out["total_n"] = design.total_n()
+    out["mothers_per_site"] = (design.mothers_per_site
+                                if isinstance(design.mothers_per_site, int)
+                                else "unequal")
+    out["seeds_per_mother"] = design.seeds_per_mother
+    out["n_mothers"] = design.n_mothers()
+    out["total_seeds"] = design.total_n()
     out["site_selection"] = design.site_selection
+    out["pollen_pool"] = design.pollen_pool
     out["seed"] = design.seed
 
     return out
