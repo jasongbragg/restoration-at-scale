@@ -103,7 +103,10 @@ def _stats_from_geno(geno: np.ndarray, seq_length: float):
     seg = (p > 0) & (p < 1)
     He = float((2 * p[seg] * (1 - p[seg])).mean()) if seg.sum() > 0 else 0.0
     correction = n / (n - 1) if n > 1 else 1.0
-    pi = float((correction * 2 * p[seg] * (1 - p[seg])).mean() / seq_length) \
+    # pi = sum of n/(n-1)*2pq over all segregating sites, divided by sequence
+    # length. Must use .sum(), not .mean() -- mean would miss the n_seg factor
+    # and underestimate pi by ~5 orders of magnitude at typical site densities.
+    pi = float((correction * 2 * p[seg] * (1 - p[seg])).sum() / seq_length) \
         if seg.sum() > 0 else 0.0
     folded = np.minimum(counts[seg].astype(int), n - counts[seg].astype(int))
     afs = np.bincount(folded, minlength=n // 2 + 1).astype(float)
